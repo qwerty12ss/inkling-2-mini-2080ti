@@ -1,0 +1,40 @@
+{
+  "model": "inkling-2-mini-3loop-vision-gpu-448k",
+  "input": "synthetic-inventory-and-coffee-v1",
+  "image_sha256": "cfb94a498f9bd611949bd98afbf9951871e71914bfe106ce1a96ed09ff8632c4",
+  "input_tokens": 8192,
+  "max_tokens": 256,
+  "tokenize_only": false,
+  "cases": [
+    {
+      "phase": "cold",
+      "input_tokens": 8192,
+      "output_tokens": 46,
+      "image_tokens": 521,
+      "cached_tokens": 0,
+      "computed_tokens": 8192,
+      "engine_ttft_s": 1.654064655303955,
+      "engine_prefill_s": 1.6009284439933253,
+      "engine_decode_s": 0.2203306550072739,
+      "client_wall_s": 1.8842082429910079,
+      "engine_decode_tok_s": 204.23848873192154,
+      "answer": "COFFEE Q7M42",
+      "ocr_ok": true
+    },
+    {
+      "phase": "repeat",
+      "input_tokens": 8192,
+      "output_tokens": 46,
+      "image_tokens": 521,
+      "cached_tokens": 6144,
+      "computed_tokens": 2048,
+      "engine_ttft_s": 0.47962331771850586,
+      "engine_prefill_s": 0.41417650200310163,
+      "engine_decode_s": 0.2206005039915908,
+      "client_wall_s": 0.7108219109941274,
+      "engine_decode_tok_s": 203.9886545395897,
+      "answer": "COFFEE Q7M42",
+      "ocr_ok": true
+    }
+  ]
+}

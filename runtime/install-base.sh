@@ -8,6 +8,7 @@ if [[ ${1:-} == --help ]]; then usage; exit 0; fi
 [[ $# == 1 ]] || { usage >&2; exit 2; }
 mkdir -p -- "$1"
 work=$(cd -- "$1" && pwd)
+runtime=$(cd -- "$(dirname -- "$0")" && pwd)
 
 checkout() {
     local path=$1 origin=$2 revision=$3
@@ -54,11 +55,12 @@ export MAX_JOBS=${MAX_JOBS:-4} NVCC_THREADS=${NVCC_THREADS:-1}
 export CMAKE_BUILD_PARALLEL_LEVEL="$MAX_JOBS"
 export UV_HTTP_TIMEOUT=${UV_HTTP_TIMEOUT:-300}
 
-uv pip install --python "$py" --torch-backend=cu130 \
+install=(uv pip install --python "$py" --constraint "$runtime/constraints-cu130.txt")
+"${install[@]}" --torch-backend=cu130 \
     'torch==2.13.0+cu130' 'torchvision==0.28.0+cu130' 'torchaudio==2.11.0+cu130' 'torchcodec==0.17.0+cu130'
-uv pip install --python "$py" cmake==4.4.4 ninja==1.13.2 packaging==26.3 setuptools==78.1.0 \
+"${install[@]}" cmake==4.4.4 ninja==1.13.2 packaging==26.3 setuptools==78.1.0 \
     setuptools-scm==10.3.4 setuptools-rust==1.13.0 wheel==0.48.0 jinja2==3.1.6 regex==2026.9.29 build==1.6.1
-uv pip install --python "$py" --no-build-isolation --torch-backend=cu130 -e "$work/abi" \
+"${install[@]}" --no-build-isolation --torch-backend=cu130 -e "$work/abi" \
     'numpy==2.3.5' 'transformers==5.20.2' 'huggingface-hub==2.3.0' 'safetensors==0.8.0' \
     'tokenizers==0.23.3' 'orjson==3.13.0' 'pillow==12.3.0'
 "$py" "$work/abi/tools/patch_torch_inductor_e8m0.py"
