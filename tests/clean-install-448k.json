@@ -1,0 +1,49 @@
+{
+  "model": "inkling-2-mini-3loop-vision-gpu-448k",
+  "input": "synthetic-inventory-and-coffee-v1",
+  "image_sha256": "cfb94a498f9bd611949bd98afbf9951871e71914bfe106ce1a96ed09ff8632c4",
+  "input_tokens": 458496,
+  "max_tokens": 256,
+  "tokenize_only": false,
+  "cases": [
+    {
+      "phase": "cold",
+      "input_tokens": 458496,
+      "output_tokens": 46,
+      "image_tokens": 521,
+      "cached_tokens": 0,
+      "computed_tokens": 458496,
+      "engine_ttft_s": 201.2257695198059,
+      "engine_prefill_s": 199.470890978002,
+      "engine_decode_s": 0.38437498699931893,
+      "client_wall_s": 201.6459129499999,
+      "engine_decode_tok_s": 117.07317469146278,
+      "answer": "COFFEE Q7M42",
+      "ocr_ok": true
+    },
+    {
+      "phase": "repeat",
+      "input_tokens": 458496,
+      "output_tokens": 46,
+      "image_tokens": 521,
+      "cached_tokens": 456704,
+      "computed_tokens": 1792,
+      "engine_ttft_s": 3.111262559890747,
+      "engine_prefill_s": 1.3875211599952308,
+      "engine_decode_s": 0.3988883749989327,
+      "client_wall_s": 3.560013203008566,
+      "engine_decode_tok_s": 112.81351581158614,
+      "answer": "COFFEE Q7M42",
+      "ocr_ok": true
+    }
+  ],
+  "memory_sample": {
+    "method": "nvidia-smi memory.free, MiB; both requests including tokenization",
+    "poll_delay_s": 0.5,
+    "sample_count": 363,
+    "min_free_mib_by_rank": [
+      793,
+      793
+    ]
+  }
+}

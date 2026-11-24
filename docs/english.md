@@ -32,3 +32,5 @@ python3 benchmarks/run_text.py --model inkling-2-mini-3loop --tokens 32768 --see
 ```
 
 The smoke test checks an arithmetic answer, a real prefix hit on a repeated request and, in vision mode, OCR on the published photo. A cold result for a running service excludes initial compilation and checkpoint loading. The historical dataset includes experiments on sparse verification, KV compression and cache-boundary correctness, plus examples where the model answered incorrectly at long context. [Experiments](experiments.md) · [Numerical evidence](experiments-data.json) · [Observed smoke-test output](../tests/observed-smoke.json)
+
+A separate clean build from this recipe ran the public 458,496-token image prompt on the same two cards. Both responses read `COFFEE Q7M42`. Engine TTFT was 201.23 seconds cold and 3.11 seconds on repeat, with 456,704 cached input tokens. Each trial generated 46 output tokens. In the 32K text replay, median decode reached 182.40 tokens/s across three seeds, compared with the historical 182.46. [Clean-build vision trial](../tests/clean-install-448k.json) · [Rebuilt 32K text data](../tests/rebuilt-text-32k.json)
