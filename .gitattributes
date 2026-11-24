@@ -1,0 +1,4 @@
+# A single space marks a blank context line in unified diffs. Preserve generated FlashInfer inputs.
+*.patch whitespace=-blank-at-eol
+runtime/flashinfer/build.ninja.in whitespace=-blank-at-eol
+runtime/flashinfer/**/batch_prefill_config.inc whitespace=-blank-at-eol

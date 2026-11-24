@@ -1,0 +1,73 @@
+# Сборка рантайма для Turing
+
+Python-код модели и CUDA-расширения взяты из двух разных ревизий. За поддержку Inkling 2 и DSpark отвечает зафиксированная ревизия основного vLLM. Пять расширений с ABI LibTorch и комплект Triton Kernels собираются по исходникам форка weicj для 2080 Ti. Поверх этой базы рецепт добавляет ядра attention, MoE, проекций, обработку prefix cache и визуальный энкодер. Один каталог сборки поддерживает оба профиля запуска.
+
+## Окружение
+
+При публикации на стенде стояли Ubuntu 24.04.5 x86-64 и драйвер NVIDIA 580.178.04, два Xeon E5-2686 v4 образовывали два NUMA-узла. Лимит мощности каждой RTX 2080 Ti составлял 235 Вт. Частоты карт во время исторических прогонов по точкам не записывали.
+
+Сборка использовала Python 3.12, GCC/G++ 13, CUDA Toolkit 13.0 с `nvcc`, PyTorch 2.13.0+cu130, Triton 3.7.1 и FlashInfer 0.6.18.post1. Нужны Git, Bash, `uv`, заголовки Python и драйвер NVIDIA с поддержкой CUDA 13.0. Используйте диск с местом для компиляции, кэшей, исходных весов и локальной упаковки. На время сборки большие загрузки и компиляция используют CPU, диск и системную память.
+
+Из корня клона:
+
+```bash
+export WORK_DIR="$PWD/.work"
+export CUDA_HOME=/usr/local/cuda-13.0
+export MAX_JOBS=4
+
+runtime/install-base.sh "$WORK_DIR"
+python3.12 runtime/prepare.py --work-dir "$WORK_DIR"
+runtime/build.sh "$WORK_DIR"
+"$WORK_DIR/.venv/bin/python" runtime/verify_native.py "$WORK_DIR"
+source "$WORK_DIR/.venv/bin/activate"
+```
+
+`MAX_JOBS` задаёт параллелизм сборки. Можно снизить его на машине с меньшим запасом RAM. Выберите путь без пробелов. После сборки скачайте веса, подготовьте плотные матрицы и запустите нужный профиль. [Инструкция запуска](run.md)
+
+## Что делает каждый шаг
+
+| Команда | Результат |
+|---|---|
+| `runtime/install-base.sh` | Создаёт `.venv`, загружает ревизии ABI, CUTLASS и исходников Triton. Собирает и устанавливает форк weicj для compute capability 7.5. Вариант `--sources-only` только загружает исходники. |
+| `runtime/prepare.py` | Сверяет SHA-256 архива vLLM, распаковывает его во временный каталог, применяет patch, добавляет Python-модули и помещает дерево в `$WORK_DIR/vllm`. Поддерживает повторный вызов для того же набора исходников. |
+| `runtime/build.sh` | Подключает пять расширений ABI из `$WORK_DIR/abi`, собирает библиотеки модели и шесть модулей FlashInfer, затем проверяет импорты, регистрацию Marlin и экспортируемые функции. |
+| `runtime/verify_native.py` | Сопоставляет машинные инструкции SM75 с контрольными суммами работающего профиля. Нужен `cuobjdump` из CUDA Toolkit. |
+
+Если архив vLLM уже скачан, его можно указать явно:
+
+```bash
+python3.12 runtime/prepare.py --work-dir "$WORK_DIR" --archive /path/to/vllm.tar.gz
+```
+
+Полная SHA-256 архива codeload — `d45373a19993e826d1a54176621f66152859986f0c1c2e219bec74e9e30be9a7`. Рецепт фиксирует контрольную сумму вместе с ревизией. Несовпадение прерывает подготовку до распаковки. Исходники доступны отдельно от бинарных сборок. [Ревизия vLLM](https://github.com/vllm-project/vllm/tree/fdda4ee7232366f4490f6484e98533de0289ac98)
+
+Для повторного использования собственного совместимого окружения можно задать `INKLING_ABI_SRC` и `PYTHON` при вызове `build.sh`. Потребуются пять собранных `*.abi3.so` в каталоге `vllm/` форка и файлы `kernel_selector.h` и `sm75_kernel_float16_fe4m3fn_float16.cu`, созданные генератором MoE Marlin при сборке форка. Публичный wheel rc3 и локальная сборка из исходников содержат разные бинарные файлы.
+
+## Какие ядра используются
+
+- **Дальнее и локальное внимание.** Шесть модулей FlashInfer воспроизводят шесть вариантов, загруженных рабочим процессом. Для двух вариантов дальнего внимания сборщик создаёт собственные копии заголовков и патчит тайлы и планировщик. Три FP32-варианта используют дополнительный заголовок `cp_async_fp32.cuh`. Shear-вариант добавляет обученное смещение ближнего внимания. Прочие штатные операции FlashInfer могут JIT-компилироваться при первом запуске. [Шаблоны и заголовки](../runtime/flashinfer/) · [База FlashInfer](https://github.com/flashinfer-ai/flashinfer/tree/8bc3b578027791336c6ae87db5c9d76f82cef8bc)
+- **Эксперты.** Адаптер skinny использует резидентную упаковку NVFP4. Отдельная специализация Marlin принимает E4M3 с группой 32 и накапливает результат в FP32. Она регистрируется в отдельном пространстве `torch.ops.inkling_sm75_f32`. Для маршрутизации собирается детерминированное выравнивание. [Исходники](../runtime/native/) · [База адаптера 1Cat](https://github.com/1CatAI/1Cat-vLLM/tree/c15d1446fa00d3196243da5de951d8ed3586de0a)
+- **Плотные матрицы, DSpark и vision.** Сборка предоставляет проекции Dense12 для активаций малой высоты и восстановление FP16-матриц для длинного префила, INT8-проекцию предварительного отбора для головы драфтера и планировщик cuBLASLt контроллера. При разрешённом вводе изображения модель создаёт SM75-энкодер на GPU каждого TP-ранга. [Код модели и кэша](../runtime/overlay/) · [Изменения в vLLM](../patches/vllm-sm75.patch)
+
+Кэш шести модулей определяется сочетанием `FLASHINFER_WORKSPACE_BASE` и `FLASHINFER_CUDA_ARCH_LIST=7.5`. По умолчанию сборщик и launcher используют `$WORK_DIR/.cache/flashinfer/0.6.18.post1/75/cached_ops`. Если вручную меняете базовый каталог кэша, экспортируйте тот же путь при запуске сервера. Для проверки стандартной раскладки:
+
+```bash
+"$WORK_DIR/.venv/bin/python" runtime/verify_native.py "$WORK_DIR"
+```
+
+При подготовке публикации в пустом рабочем каталоге пересобрали все 11 GPU-библиотек с CUDA Toolkit 13.0.88 и загрузили их с установленным ABI стенда. При сравнении с действовавшей сборкой побайтно совпали все **772 из 772** секций инструкций SM75: 720 в шести модулях FlashInfer и 52 в ядрах MoE, маршрутизации и проекций. Применение Python-патча отдельно проверили дважды во вложенном Git-клоне с оригинальным архивом. [Эталонные контрольные суммы](../runtime/sm75-code.json)
+
+Проверка сравнивает байты секций инструкций из SM75 CUBIN. Обёртки ELF, абсолютные пути компиляции и отладочные таблицы могут отличаться. Хостовая библиотека `libinkling_tune_lt.so` проверяется загрузкой и наличием функции `make_plan`. Скорость, качество и поведение кэша на конкретной паре карт проверяются клиентскими тестами после запуска сервера.
+
+## Ревизии и авторство
+
+| Компонент | Версия или ревизия |
+|---|---|
+| Python vLLM | [vllm-project/vllm, fdda4ee](https://github.com/vllm-project/vllm/tree/fdda4ee7232366f4490f6484e98533de0289ac98) |
+| CUDA ABI SM75 | [weicj/vLLM-2080Ti-Definitive, fe9872d](https://github.com/weicj/vLLM-2080Ti-Definitive/tree/fe9872d764b54ed6a1ac35804a4b6ebd813b7f56) |
+| CUTLASS | [NVIDIA/cutlass, cb42473](https://github.com/NVIDIA/cutlass/tree/cb4247394dd82148787aed73e5dc7cef33cbf862) |
+| Triton Kernels для ABI | [triton-lang/triton, 0add682](https://github.com/triton-lang/triton/tree/0add68262ab0a2e33b84524346cb27cbb2787356) |
+| FlashInfer | [v0.6.18.post1, 8bc3b57](https://github.com/flashinfer-ai/flashinfer/tree/8bc3b578027791336c6ae87db5c9d76f82cef8bc) |
+| Адаптер skinny | [1CatAI/1Cat-vLLM, c15d144](https://github.com/1CatAI/1Cat-vLLM/tree/c15d1446fa00d3196243da5de951d8ed3586de0a) · [dnv2003/v100-skinny](https://github.com/dnv2003/v100-skinny) |
+
+Часть изменений ShortConv и внимания адаптирована из следующих работ с сохранением атрибуции. [Pento95/HyperInkling](https://github.com/Pento95/HyperInkling) · [snailbrainx/inkling-2-mini-sm80](https://github.com/snailbrainx/inkling-2-mini-sm80) · [peaster/inkling-2-mini-vllm-2x3090](https://github.com/peaster/inkling-2-mini-vllm-2x3090) · [Лицензии и NOTICE](../runtime/licenses/) · [Лицензии skinny](../runtime/native/skinny/) · [NOTICE FlashInfer](../runtime/flashinfer/NOTICE)

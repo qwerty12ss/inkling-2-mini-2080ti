@@ -1,0 +1,34 @@
+inkling-2-mini-sm80
+Copyright 2026 snailbrainx
+
+This product includes software from the vLLM project (https://github.com/vllm-project/vllm),
+Copyright contributors to the vLLM project, licensed under the Apache License, Version 2.0.
+
+The following files under patches/vllm/ are modified copies of files from the
+vllm/vllm-openai:inkling-2-mini image (vLLM 0.1.dev25855+g7cb5dae22), changed to run on
+NVIDIA sm_80 (Ampere) GPUs and to run faster there; patches/sm80.diff shows every change:
+
+  models/inkling2/nvidia/attention.py
+  models/inkling2/nvidia/dspark.py
+  models/inkling2/nvidia/loop.py
+  models/inkling2/nvidia/model.py
+  models/inkling2/nvidia/moe.py
+  models/inkling2/nvidia/ops/attention.py
+  models/inkling2/nvidia/ops/attention_sm90.py
+  models/inkling2/nvidia/ops/conv_mix.py
+  models/inkling2/nvidia/ops/gemv.py
+  models/inkling2/nvidia/ops/linear.py
+  models/inkling2/nvidia/ops/moe_sm90.py
+  models/inkling2/nvidia/ops/sconv.py
+  models/inkling2/quant_config.py
+  models/inkling2/speculator.py
+
+This product includes software from Humming (https://github.com/vllm-project/humming),
+Copyright Humming contributors, licensed under the Apache License, Version 2.0.
+site/humming_include/humming/epilogue/gmem_writer.cuh is a modified copy of Humming's
+include/humming/epilogue/gmem_writer.cuh (humming-kernels 0.1.20, as shipped in that image),
+changed to fuse the expert activation and routing weight into the GEMM epilogue.
+
+The Triton kernels in site/inkling_sm80_ops.py and site/inkling_sm80_moe_align.py and the
+CUDA kernels in csrc/inkling_sm80_cuda.cu are written for this repository and reproduce the
+behaviour of the corresponding vLLM operations.

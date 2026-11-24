@@ -1,0 +1,1525 @@
+--- a/vllm/_custom_ops.py
++++ b/vllm/_custom_ops.py
+@@ -1120,6 +1120,8 @@
+     size_n: int,
+     num_bits: int,
+ ) -> torch.Tensor:
++    if current_platform.is_device_capability(75):
++        return torch.ops._C.gptq_marlin_repack(b_q_weight, size_k, size_n, num_bits, False)
+     return torch.ops._C.gptq_marlin_repack(b_q_weight, size_k, size_n, num_bits)
+ 
+ 
+@@ -2139,7 +2141,7 @@
+     expert_map: torch.Tensor | None = None,
+     scatter_idx: torch.Tensor | None = None,
+ ) -> None:
+-    if current_platform.is_xpu():
++    if current_platform.is_xpu() or current_platform.is_device_capability(75):
+         if scatter_idx is not None:
+             raise NotImplementedError("scatter_idx is not supported on XPU")
+         torch.ops._moe_C.moe_align_block_size(
+@@ -3334,9 +3336,12 @@
+     rank: int,
+     fully_connected: bool,
+ ) -> int:
+-    return torch.ops._C_custom_ar.init_custom_ar(
+-        ipc_tensors, rank_data, rank, fully_connected
+-    )
++    op = torch.ops._C_custom_ar.init_custom_ar.default
++    args = op._schema.arguments
++    if args[-1].name == "same_node":
++        # The research launcher pins both TP ranks to this machine's two NVLink GPUs.
++        return op(ipc_tensors, rank_data, rank, fully_connected, True)
++    return op(ipc_tensors, rank_data, rank, fully_connected)
+ 
+ 
+ def all_reduce(
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -655,12 +655,30 @@
+         return pp_size
+ 
+     @property
++    def small_batch_overlap_limit(self) -> int | None:
++        # The single-sequence Inkling profile serializes large prefill batches.
++        # Short verify/decode steps keep the normal asynchronous batch queue.
++        if (
++            os.environ.get("INKLING_SERIAL_LARGE_PREFILL") == "1"
++            and self.parallel_config.pipeline_parallel_size == 1
++            and self.scheduler_config.max_num_seqs == 1
++            and self.scheduler_config.async_scheduling
++        ):
++            return min(8, self.scheduler_config.max_num_batched_tokens)
++        return None
++
++    @property
+     def max_in_flight_tokens(self) -> int:
+         # Upper bound on tokens that are scheduled but not yet settled (freed):
+         # every concurrent batch may hold up to a full `max_num_batched_tokens`.
+         # Recycling-aware KV cache specs (sliding-window, chunked-local) reserve
+         # for this because out-of-window blocks are freed on the processed-token
+         # basis, so in-flight steps transiently keep their blocks.
++        overlap_limit = self.small_batch_overlap_limit
++        if overlap_limit is not None:
++            return self.scheduler_config.max_num_batched_tokens + (
++                self.max_concurrent_batches - 1
++            ) * overlap_limit
+         return (
+             self.max_concurrent_batches * self.scheduler_config.max_num_batched_tokens
+         )
+--- a/vllm/distributed/device_communicators/cuda_communicator.py
++++ b/vllm/distributed/device_communicators/cuda_communicator.py
+@@ -159,6 +159,7 @@
+             # Initialize a custom fast all-reduce implementation.
+             self.ca_comm = CustomAllreduce(
+                 group=self.cpu_group,
++                max_size=16 * 1024 * 1024,
+                 device=self.device,
+                 symm_mem_enabled=(
+                     self.symm_mem_comm is not None and not self.symm_mem_comm.disabled
+--- a/vllm/model_executor/layers/fused_moe/moe_align_block_size.py
++++ b/vllm/model_executor/layers/fused_moe/moe_align_block_size.py
+@@ -169,6 +169,20 @@
+     return sorted_ids, expert_ids, num_tokens_post_pad
+ 
+ 
++_original_align = moe_align_block_size
++
++def moe_align_block_size(topk_ids, block_size, num_experts, expert_map=None,
++                         pad_sorted_ids=False, ignore_invalid_experts=False, *, return_scatter_idx=False):
++    if (topk_ids.ndim == 2 and topk_ids.shape[1] == 8 and topk_ids.numel() > 0
++            and topk_ids.is_cuda and topk_ids.is_contiguous() and topk_ids.dtype == torch.int32
++            and num_experts == 128 and block_size in (8,16,48) and expert_map is None
++            and not (pad_sorted_ids or ignore_invalid_experts or return_scatter_idx)):
++        from inkling_native_align import align
++        return align(topk_ids,block_size,num_experts)
++    return _original_align(topk_ids,block_size,num_experts,expert_map,pad_sorted_ids,
++                           ignore_invalid_experts,return_scatter_idx=return_scatter_idx)
++
++
+ def batched_moe_align_block_size(
+     max_tokens_per_batch: int, block_size: int, expert_num_tokens: torch.Tensor
+ ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+--- a/vllm/models/inkling/nvidia/sconv_swa_attn.py
++++ b/vllm/models/inkling/nvidia/sconv_swa_attn.py
+@@ -16,7 +16,9 @@
+ 
+ from __future__ import annotations
+ 
++import os
+ from dataclasses import dataclass
++from collections.abc import Sequence
+ from typing import ClassVar
+ 
+ import torch
+@@ -32,13 +34,191 @@
+     AttentionMetadataBuilder,
+     CommonAttentionMetadata,
+ )
+-from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
+-from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayerConfig
++from vllm.v1.core.single_type_kv_cache_manager import (
++    DFlashSlidingWindowManager,
++    SlidingWindowManager,
++)
++from vllm.utils.math_utils import cdiv
++from vllm.v1.core.kv_cache_utils import KVCacheBlock
++from vllm.v1.kv_cache_interface import (
++    AttentionSpec,
++    KVCacheGroup,
++    KVCacheLayerConfig,
++    ManagerConfig,
++)
+ 
+ from .ops.sconv import sconv_seq_metadata
+ 
+ # Stream order within the per-head packed D (== contiguous sub-ranges).
+ _K, _V, _ATTN, _MLP = 0, 1, 2, 3
++
++
++def _conv_tail_enabled() -> bool:
++    # Exclusive opt-in for the SM75 benchmark.
++    enabled = os.environ.get("INKLING_SM75_CONV_TAIL", "0")
++    return enabled == "1"
++
++
++def _conv_checkpoint_tokens(vllm_config: VllmConfig) -> int:
++    """Tokens between conv-state checkpoints inside a prefill chunk; 0 is none.
++
++    Follows `--prefix-cache-retention-interval`: at its default of 0 only the
++    ends of steps can be hit (the scheduler ends chunks at replay boundaries
++    and shared-prefix junctions), a positive interval keeps conv state at that
++    interval as well, and `None` (dense) at every hit alignment.
++    """
++    interval = vllm_config.cache_config.prefix_cache_retention_interval
++    if interval is None:
++        return vllm_config.cache_config.block_size
++    return interval
++
++
++class SconvStateManager(DFlashSlidingWindowManager):
++    """Conv-state cache that backs only each step's tail, plus sparse checkpoints.
++
++    The tail-only part is adapted from Pento95/HyperInkling (Apache-2.0); the
++    checkpoints are added here.
++
++    The conv reads cached taps only for the first `W - 1` tokens of a step
++    (later taps come from the step's own inputs), so a step needs real blocks
++    just for its last tokens: the window, the drafts in flight that may be
++    rejected, and one hit alignment so that a prefix hit at the aligned
++    position below the step's end finds its window. The rest of a prefill
++    chunk is null, and the conv skips its stores there.
++
++    Hits use the plain sliding-window rule (`h` needs the window before `h`).
++    Inside a chunk that leaves only the checkpoints, which exist when the
++    prefix-cache retention interval asks for them: the one block below every
++    `checkpoint_tokens` boundary stays real.
++    """
++
++    @dataclass(frozen=True, slots=True)
++    class Params(DFlashSlidingWindowManager.Params):
++        hit_alignment_tokens: int = 0
++        checkpoint_tokens: int = 0
++
++        @property
++        def tail_tokens(self) -> int:
++            return (
++                self.sliding_window
++                + self.num_speculative_tokens * self.max_in_flight_steps
++                + self.hit_alignment_tokens
++            )
++
++    find_longest_cache_hit = SlidingWindowManager.__dict__["find_longest_cache_hit"]
++    reachable_block_mask = SlidingWindowManager.__dict__["reachable_block_mask"]
++
++    @classmethod
++    def max_admission_blocks(
++        cls,
++        config: ManagerConfig,
++        block_size: int,
++        max_in_flight_tokens: int,
++        max_model_len: int,
++    ) -> int | None:
++        params = config.params
++        assert isinstance(params, SconvStateManager.Params)
++        tail_blocks = super().max_admission_blocks(
++            config, block_size, max_in_flight_tokens, max_model_len
++        )
++        if tail_blocks is None or not params.checkpoint_tokens:
++            return tail_blocks
++        # Every token in flight backed: the plain sliding-window bound.
++        window_blocks = SlidingWindowManager.max_admission_blocks(
++            config,
++            block_size,
++            max_in_flight_tokens + params.num_lookahead_tokens,
++            max_model_len,
++        )
++        assert window_blocks is not None
++        # Checkpoints are freed with the processed prefix, so a request holds
++        # those of its chunks in flight.
++        checkpoints = (
++            cdiv(max_in_flight_tokens, params.checkpoint_tokens)
++            + params.max_in_flight_steps
++        )
++        return min(window_blocks, tail_blocks + checkpoints)
++
++    def __init__(self, kv_cache_group: KVCacheGroup, **kwargs) -> None:
++        super().__init__(kv_cache_group, **kwargs)
++        params = self.manager_config.params
++        assert isinstance(params, SconvStateManager.Params)
++        assert self.cache_hit_alignment_tokens <= params.hit_alignment_tokens, (
++            "conv-state tails shorter than the prefix-hit alignment"
++        )
++        # Blocks between checkpoints; 0 without prefix caching.
++        self._checkpoint_blocks = 0
++        if params.checkpoint_tokens and self.enable_caching:
++            assert params.checkpoint_tokens % params.hit_alignment_tokens == 0
++            assert params.checkpoint_tokens % self.block_size == 0
++            assert params.sliding_window - 1 <= self.block_size
++            self._checkpoint_blocks = params.checkpoint_tokens // self.block_size
++
++    def _num_checkpoints(self, first_block: int, last_block: int) -> int:
++        """Checkpoint blocks among block indices `[first_block, last_block)`:
++        those that end on a checkpoint boundary."""
++        interval = self._checkpoint_blocks
++        if not interval or last_block <= first_block:
++            return 0
++        return last_block // interval - first_block // interval
++
++    def get_num_blocks_to_allocate(
++        self,
++        request_id: str,
++        num_tokens: int,
++        new_computed_blocks: Sequence[KVCacheBlock],
++        total_computed_tokens: int,
++        num_local_computed_tokens: int,
++        num_tokens_main_model: int,
++        apply_admission_cap: bool = False,
++        prefill_end: int = 0,
++    ) -> int:
++        num_blocks = super().get_num_blocks_to_allocate(
++            request_id,
++            num_tokens,
++            new_computed_blocks,
++            total_computed_tokens,
++            num_local_computed_tokens,
++            num_tokens_main_model,
++            apply_admission_cap=apply_admission_cap,
++            prefill_end=prefill_end,
++        )
++        first_new = len(self.req_to_blocks.get(request_id, ())) + len(
++            new_computed_blocks
++        )
++        return num_blocks + self._num_checkpoints(
++            first_new, self._num_unbacked_leading_blocks(num_tokens_main_model)
++        )
++
++    def allocate_new_blocks(
++        self, request_id: str, num_tokens: int, num_tokens_main_model: int
++    ) -> list[KVCacheBlock]:
++        req_blocks = self.req_to_blocks[request_id]
++        first_new = len(req_blocks)
++        new_blocks = super().allocate_new_blocks(
++            request_id, num_tokens, num_tokens_main_model
++        )
++        interval = self._checkpoint_blocks
++        if not interval:
++            return new_blocks
++        # super() appended the unbacked run first: `new_blocks[i]` is
++        # `req_blocks[first_new + i]` while it is null.
++        num_nulls = 0
++        while num_nulls < len(new_blocks) and new_blocks[num_nulls].is_null:
++            num_nulls += 1
++        checkpoints = [
++            i
++            for i in range(first_new, first_new + num_nulls)
++            if (i + 1) % interval == 0
++        ]
++        if checkpoints:
++            backed = self.block_pool.get_new_blocks(len(checkpoints))
++            for i, block in zip(checkpoints, backed):
++                req_blocks[i] = block
++                new_blocks[i - first_new] = block
++            if self._record_new_block_ids:
++                self.new_block_ids.extend(b.block_id for b in backed)
++        return new_blocks
+ 
+ 
+ @dataclass
+@@ -173,8 +353,8 @@
+         )
+         vllm_config = get_current_vllm_config()
+         self._dtype = vllm_config.model_config.dtype
+-        assert self._dtype == torch.bfloat16, (
+-            f"sconv SWA cache supports bfloat16 only, got {self._dtype}"
++        assert self._dtype in (torch.float16, torch.bfloat16), (
++            f"sconv SWA cache requires a 16-bit floating type, got {self._dtype}"
+         )
+         # Register in the forward context so the runner enumerates this owner as
+         # an attention-like layer (get_kv_cache_config / get_attn_backend).
+@@ -203,6 +383,16 @@
+             head_size_v=0,  # all 4 streams packed into head_size
+             dtype=self._dtype,
+         )
+-        return SlidingWindowManager.layer_config(
+-            spec, sliding_window=self.sliding_window
+-        )
++        if not _conv_tail_enabled():
++            return SlidingWindowManager.layer_config(
++                spec, sliding_window=self.sliding_window
++            )
++        return SconvStateManager.layer_config(
++            spec,
++            sliding_window=self.sliding_window,
++            num_speculative_tokens=vllm_config.num_speculative_tokens,
++            max_in_flight_steps=vllm_config.max_concurrent_batches,
++            num_lookahead_tokens=vllm_config.num_lookahead_tokens,
++            hit_alignment_tokens=vllm_config.cache_config.block_size,
++            checkpoint_tokens=_conv_checkpoint_tokens(vllm_config),
++        )
+--- a/vllm/models/inkling2/nvidia/attention.py
++++ b/vllm/models/inkling2/nvidia/attention.py
+@@ -58,7 +58,9 @@
+     plan_decode_attention,
+     rel_decode_attention,
+ )
+-from .ops.attention_sm90 import MODE_OUT_LSE, rel_attention
++from .ops.attention_sm90 import (
++    MODE_OUT_LSE, USE_TURING_SHEAR, rel_attention, segmented_turing_prefill,
++)
+ from .ops.linear import linear
+ from .ops.ll_gemm_sm120 import qkv_bmm, use_qkv_bmm
+ from .ops.sconv import attention_prologue, shift_rel_proj
+@@ -309,6 +311,8 @@
+ 
+     def process_weights_after_loading(self) -> None:
+         self.rel_proj_shifted = shift_rel_proj(self.rel_logits_proj, self.is_local)
++        from dense12_serving import init as _init_dense12
++        self._dense12_banks = _init_dense12(self)
+ 
+     def get_attn_backend(self) -> type[AttentionBackend]:
+         return Inkling2AttentionBackend
+@@ -333,13 +337,31 @@
+     ) -> list[torch.Tensor]:
+         # ``linear`` on the weight bypasses the layer (and a LoRA wrapper's
+         # forward), so the LoRA deltas are added here (no-op without LoRA).
+-        weight = self.qkvr.weight
++        if getattr(self, '_dense12_banks', None) is not None:
++            bank = self._dense12_banks[0]
++            if x_q.dtype == torch.float16 and 1 <= x_q.shape[0] <= 8:
++                common = x_k is x_q and x_v is x_q
++                bank.report('direct' if common else 'segmented', x_q.shape[0])
++                projected = bank.project(x_q) if common else bank.project(x_q, x_k, x_v)
++                return list(projected.split(self.split_sizes, dim=-1)[:6])
++            bank.report('materialize', x_q.shape[0])
++            weight = bank.materialize()
++        else:
++            weight = self.qkvr.weight
+         if x_k is x_q and x_v is x_q:
+             projected = linear(x_q, weight)
+             add_linear_lora(self.qkvr, projected, x_q, range(6))
+             return list(projected.split(self.split_sizes, dim=-1)[:6])
+         q_side, kv_size = sum(self.split_sizes[:4]), self.split_sizes[4]
+         k_end = q_side + kv_size
++        from inkling_qkv_views import project as _group_qkv
++        fast = _group_qkv(x_q, x_k, x_v, weight, q_side, kv_size, sum(self.q_side_splits))
++        if fast is not None:
++            projected, k, v = fast
++            add_linear_lora(self.qkvr, projected, x_q, range(4))
++            add_linear_lora(self.qkvr, k, x_k, [4])
++            add_linear_lora(self.qkvr, v, x_v, [5])
++            return [*projected.split(self.q_side_splits, dim=-1)[:4], k, v]
+         if use_qkv_bmm(x_q, x_k, x_v, weight):
+             projected = qkv_bmm(x_q, x_k, x_v, weight, q_side, k_end)
+             splits = projected.split(self.split_sizes, dim=-1)
+@@ -403,7 +425,16 @@
+             output,
+             pass_idx,
+         )
+-        out = linear(output, self.wo_ud.weight, out)
++        if getattr(self, '_dense12_banks', None) is not None:
++            bank = self._dense12_banks[1]
++            if out is None and output.dtype == torch.float16 and 1 <= output.shape[0] <= 8:
++                bank.report('direct', output.shape[0])
++                out = bank.project(output)
++            else:
++                bank.report('materialize', output.shape[0])
++                out = linear(output, bank.materialize(), out)
++        else:
++            out = linear(output, self.wo_ud.weight, out)
+         add_linear_lora(self.wo_ud, out, output)
+         return out
+ 
+@@ -594,6 +625,7 @@
+             softmax_scale=self.scaling,
+             is_local=self.is_local,
+             num_splits=num_splits,
++            seq_len_upper_bound=md.max_seq_len,
+         )
+ 
+     def _fa4_attention(
+@@ -615,6 +647,21 @@
+         if num_decodes:
+             cu_seqlens_q = cu_seqlens_q - num_decode_tokens
+         key_cache, value_cache = self._split_kv_cache(kv_cache)
++        if (torch.cuda.get_device_capability(q.device) == (7, 5)
++                and (not self.is_local or (USE_TURING_SHEAR and nt >= 128)) and not self.fp8_kv
++                and len(md.seq_lens_cpu) - num_decodes == 1
++                and md.query_lens_cpu[num_decodes] == nt):
++            segmented_turing_prefill(
++                q[:nt], key_cache, value_cache, out[:nt], lse[:, :nt], rel_logits,
++                seq_len=int(md.seq_lens_cpu[num_decodes]),
++                block_table=md.block_table[num_decodes:],
++                cache_seqlens=md.seq_lens[num_decodes:], cu_seqlens_q=cu_seqlens_q,
++                max_query_len=md.max_query_len, softmax_scale=self.scaling,
++                window=self.sliding_window if self.is_local else 0,
++            )
++            out[nt:].zero_()
++            lse[:, nt:].zero_()
++            return
+         if not use_sm100_kernels():
+             rel_attention(
+                 q[:nt],
+--- a/vllm/models/inkling2/nvidia/dspark.py
++++ b/vllm/models/inkling2/nvidia/dspark.py
+@@ -99,7 +99,7 @@
+     )
+     assert flashinfer_comm is not None and workspace is not None
+     assert workspace.backend == "mnnvl"
+-    assert x.dtype == residual.dtype == norm.weight.dtype == torch.bfloat16
++    assert x.dtype == residual.dtype == norm.weight.dtype == torch.float16
+     assert x.shape == residual.shape and residual.is_contiguous()
+     flashinfer_trtllm_fused_allreduce_norm(
+         allreduce_in=x,
+@@ -243,6 +243,7 @@
+                 block=self.block,
+                 window=self.window,
+                 num_splits=num_splits,
++                seq_len_upper_bound=md.max_seq_len,
+             )
+         return linear(out, self.o_proj.weight)
+ 
+@@ -487,7 +488,7 @@
+         """Finish sharing the target's normalized embeddings and LM head (its
+         `embed_tokens` and `lm_head` are aliased by `load_dspark_model`)
+         and derive the weights that depend on them."""
+-        assert self.lm_head is not None and self.lm_head.weight.dtype == torch.bfloat16
++        assert self.lm_head is not None and self.lm_head.weight.dtype == torch.float16
+         self.model.embed_norm = target_model.model.embed_norm
+         head = self.model.markov_head
+         head.rnn_bias = torch.empty_like(head.rnn_proj.bias, dtype=torch.float32)
+@@ -506,6 +507,9 @@
+         self.model.fuse_alpha.copy_(
+             torch.softmax(self.model.fuse_weight.float(), dim=-1)
+         )
++
++        from proposal_head import refresh as refresh_auxiliary_head
++        refresh_auxiliary_head(self)
+ 
+     def get_draft_kv_cache_layer_names(self) -> list[str]:
+         return [layer.self_attn.attn.layer_name for layer in self.model.layers]
+@@ -579,6 +583,8 @@
+                     name, shard = name.replace(old, new), shard_id
+                     break
+             param = params[name]
++            if param.dtype == torch.float16 and weight.dtype == torch.bfloat16:
++                weight = weight.to(torch.float16)
+             if weight.dtype != param.dtype:
+                 raise ValueError(f"{name}: expected {param.dtype}, got {weight.dtype}")
+             if shard is None:
+--- a/vllm/models/inkling2/nvidia/loop.py
++++ b/vllm/models/inkling2/nvidia/loop.py
+@@ -12,6 +12,7 @@
+ (and small batches at TP > 1 with its all-reduce); without sequence parallel.
+ """
+ 
++import os
+ from collections.abc import Sequence
+ 
+ import torch
+@@ -33,6 +34,7 @@
+ from .sconv import conv_metadata
+ 
+ LOOP_STREAMS = ("attn", "k", "v", "mlp")
++_USE_SM75_CONTROLLER = os.environ.get("INKLING_SM75_CONTROLLER") == "1"
+ 
+ 
+ class Inkling2MessageController(nn.Module):
+@@ -57,8 +59,8 @@
+         """fp32 `(T, D)` `dest` and `message` -> fp32 `(T, D)`."""
+         pair = torch.stack((dest, message), dim=1)
+         pair = pair * torch.rsqrt(pair.square().mean(-1, keepdim=True) + 1e-6)
+-        normalized = pair.to(torch.bfloat16).flatten(1)
+-        hidden = linear_k_groups(normalized, self.down_weight, torch.bfloat16)
++        normalized = pair.to(torch.float16).flatten(1)
++        hidden = linear_k_groups(normalized, self.down_weight, torch.float16)
+         gain = torch.mm(hidden, self.gain_weight.t(), out_dtype=torch.float32)
+         forget = torch.mm(hidden, self.forget_weight.t(), out_dtype=torch.float32)
+         return (1.0 - torch.tanh(forget)) * dest + torch.tanh(gain) * message
+@@ -79,17 +81,18 @@
+             config, layer_id, quant_config, prefix, num_passes=config.num_loop_passes
+         )
+         assert config.loop_config is not None
++        self._sm75_down = None
+         rank, width = config.loop_config["gate_rank"], config.hidden_size
+         streams = len(LOOP_STREAMS)
+         # down (S, r, 2D) and [gain; forget] (S, 2D, r), bf16.
+         self.register_buffer(
+             "controller_down",
+-            torch.empty(streams, rank, 2 * width, dtype=torch.bfloat16),
++            torch.empty(streams, rank, 2 * width, dtype=torch.float16),
+             persistent=False,
+         )
+         self.register_buffer(
+             "controller_gain_forget",
+-            torch.empty(streams, 2 * width, rank, dtype=torch.bfloat16),
++            torch.empty(streams, 2 * width, rank, dtype=torch.float16),
+             persistent=False,
+         )
+         self.controllers = nn.ModuleDict(
+@@ -109,6 +112,11 @@
+             down, gain_forget = self.controller_down, self.controller_gain_forget
+             assert controller.down_weight.data_ptr() == down[i].data_ptr()
+             assert controller.gain_weight.data_ptr() == gain_forget[i].data_ptr()
++        if _USE_SM75_CONTROLLER:
++            from .ops.controller_sm75 import validated_down
++            rows = 1 + int(os.environ.get("INKLING_VERIFY_BUDGET", "7"))
++            if rows in (4, 6, 8):
++                self._sm75_down = validated_down(self.controller_down, rows)
+ 
+     def blend(
+         self,
+@@ -128,7 +136,10 @@
+             hidden = sm12x_bf16_ll_gemm(pair, down)
+             gain_forget = sm12x_bf16_ll_gemm(hidden, up, out_dtype=torch.float32)
+         else:
+-            hidden = torch.bmm(pair, down.transpose(1, 2))
++            if self._sm75_down is not None and pair.shape[:2] == (3,self._sm75_down.rows):
++                hidden = self._sm75_down.run(pair, down)
++            else:
++                hidden = torch.bmm(pair, down.transpose(1, 2))
+             gain_forget = torch.bmm(hidden, up.transpose(1, 2), out_dtype=torch.float32)
+         return blend_rms_norm(dest, message, gain_forget, norm_weight, norm_eps)
+ 
+@@ -404,3 +415,7 @@
+ class Inkling2LoopForConditionalGeneration(Inkling2ForConditionalGeneration):
+     """The `inkling2_loop` checkpoints' architecture name; the model is
+     `Inkling2ForConditionalGeneration` with an `Inkling2LoopModel`."""
++
++if os.environ.get("INKLING_LAYER_TRACE_DIR"):
++    from .ops.diagnostic_trace_sm75 import install as _install_layer_probe
++    _install_layer_probe(Inkling2LoopModel)
+--- a/vllm/models/inkling2/nvidia/model.py
++++ b/vllm/models/inkling2/nvidia/model.py
+@@ -75,7 +75,8 @@
+ from .ops.norm import rms_norm
+ from .ops.seq_parallel import SeqParallel
+ from .sconv import ATTN_STREAM, MLP_STREAM, Inkling2ShortConv, conv_metadata
+-from .vision import Inkling2VisionEncoder, VisionMetadata
++from .vision import VisionMetadata
++from inkling_vision_sm75 import SM75VisionEncoder
+ 
+ 
+ class Inkling2LogitsProcessor(LogitsProcessor):
+@@ -109,7 +110,7 @@
+         self,
+         hidden_size: int,
+         eps: float,
+-        out_dtype: torch.dtype | None = torch.bfloat16,
++        out_dtype: torch.dtype | None = torch.float16,
+         num_inputs: int = 1,
+     ) -> None:
+         super().__init__()
+@@ -560,7 +561,7 @@
+         self.config = config
+         self.text_config = text_config = config.text_config
+         self.visual = (
+-            Inkling2VisionEncoder(config.vision_config, text_config.hidden_size)
++            SM75VisionEncoder(config.vision_config, text_config.hidden_size)
+             if config.vision_config is not None
+             and vllm_config.model_config.multimodal_config is not None
+             and vllm_config.model_config.multimodal_config.get_limit_per_prompt("image")
+@@ -680,7 +681,7 @@
+         per_item = -(-token_budget // max_batch_size)
+         pixels = torch.zeros(
+             (max_batch_size * per_item, side, side, 3),
+-            dtype=torch.bfloat16,
++            dtype=torch.float16,
+             device=device,
+         )
+         grid = [[1, 1, per_item]] * max_batch_size
+@@ -785,6 +786,8 @@
+                     continue
+                 raise ValueError(f"Unexpected checkpoint tensor: {name}")
+             param = params[name]
++            if param.dtype == torch.float16 and weight.dtype == torch.bfloat16:
++                weight = weight.to(torch.float16)
+             if param.dtype != weight.dtype:
+                 if ".mlp.experts." in name and weight.dtype == torch.bfloat16:
+                     raise ValueError(
+--- a/vllm/models/inkling2/nvidia/moe.py
++++ b/vllm/models/inkling2/nvidia/moe.py
+@@ -7,6 +7,7 @@
+ `model.llm.layers.N.mlp` map 1:1 to parameters.
+ """
+ 
++import os
+ from collections.abc import Callable, Sequence
+ from typing import Literal, Protocol
+ 
+@@ -74,7 +75,7 @@
+         self.topk = config.num_experts_per_tok
+         self.route_scale = config.route_scale
+         self.weight = nn.Parameter(
+-            torch.empty(num_experts, hidden, dtype=torch.bfloat16),
++            torch.empty(num_experts, hidden, dtype=torch.float16),
+             requires_grad=False,
+         )
+         self.bias = nn.Parameter(
+@@ -98,12 +99,20 @@
+         self.ep_rank = get_tensor_model_parallel_rank()
+         self.ep_size = get_tensor_model_parallel_world_size()
+         assert config.n_routed_experts % self.ep_size == 0
+-        self.num_experts = config.n_routed_experts // self.ep_size
++        self.tp75 = current_platform.is_device_capability(75)
++        self.sm75_marlin = False
++        self.mx_codes_audited = False
++        self.mx_grouped = False
++        self.num_experts = config.n_routed_experts if self.tp75 else config.n_routed_experts // self.ep_size
+         self.topk = config.num_experts_per_tok
+         self.gate_cap = config.mlp_gate_softcap
+         self.up_cap = config.mlp_up_softcap
+         self.nvfp4 = quant_format == "nvfp4"
++        self.sm75_mx_prefill = self.tp75 and not self.nvfp4 and os.environ.get("INKLING_MX_PREFILL") == "1"
+         hidden, inter = config.hidden_size, config.intermediate_size
++        if self.tp75:
++            assert inter % self.ep_size == 0
++            inter //= self.ep_size
+         self.hidden_size, self.intermediate_size = hidden, inter
+ 
+         pack, group = (2, 16) if self.nvfp4 else (1, 32)
+@@ -133,7 +142,7 @@
+                     per_expert=False,
+                 )
+ 
+-        start = self.ep_rank * self.num_experts
++        start = 0 if self.tp75 else self.ep_rank * self.num_experts
+         self.register_buffer(
+             "expert_bounds",
+             torch.tensor([start, start + self.num_experts], dtype=torch.int32),
+@@ -182,7 +191,17 @@
+ 
+     def _load_expert_shard(self, param: nn.Parameter, loaded: torch.Tensor) -> None:
+         start = self.ep_rank * self.num_experts
+-        self._load_full(param, loaded[start : start + self.num_experts])
++        if self.tp75:
++            if loaded.shape != param.shape:
++                axes = [i for i in (1, 2) if loaded.shape[i] != param.shape[i]]
++                assert len(axes) == 1
++                axis = axes[0]
++                width = param.shape[axis]
++                assert loaded.shape[axis] == width * self.ep_size
++                loaded = loaded.narrow(axis, self.ep_rank * width, width)
++            self._load_full(param, loaded)
++        else:
++            self._load_full(param, loaded[start : start + self.num_experts])
+ 
+     def _load_weight(self, param: nn.Parameter, loaded: torch.Tensor) -> None:
+         self._load_expert_shard(param, loaded)
+@@ -202,6 +221,26 @@
+         param.data.copy_(loaded)
+ 
+     def process_weights_after_loading(self) -> None:
++        if self.tp75:
++            if self.nvfp4:
++                for name in ("w13", "w2"):
++                    amax, denominator = self.scales(name)
++                    self.register_buffer(name + "_outer", (amax / denominator).contiguous())
++                from .ops.moe_sm75 import prepare_marlin
++                self.sm75_marlin = prepare_marlin(self)
++                if self.sm75_marlin:
++                    from resident_nv_runtime import prepare as prepare_resident_nv
++                    self._resident_nv = prepare_resident_nv(self)
++            elif os.environ.get("INKLING_SM75_MX_GROUPED") in ("1","compact","wide"):
++                from .ops.resident_mx import prepare as prepare_mx
++                self.mx_grouped = prepare_mx(self)
++                if not self.mx_grouped and os.environ.get("INKLING_MX_VERIFY") == "1":
++                    from .ops.mxfp8_sm75_verify import prepare_runtime
++                    self.mx_codes_audited = prepare_runtime(self)
++            elif os.environ.get("INKLING_MX_VERIFY") == "1":
++                from .ops.mxfp8_sm75_verify import prepare_runtime
++                self.mx_codes_audited = prepare_runtime(self)
++            return
+         if self.sm100 or (self.sm120 and not self.humming_nvfp4):
+             return
+         weights = {}
+@@ -289,6 +328,19 @@
+             )
+             del gate_up
+             down = self._gemm(activated, "w2", tiles, plan, 1)
++        elif self.tp75:
++            from .ops.moe_sm75 import expert_forward, marlin_forward
++            ids, gammas, src2dst = routing
++            project = marlin_forward if self.sm75_marlin else expert_forward
++            if self.sm75_marlin and self._resident_nv is not None and x.shape[0] in (4, 6, 8) and x.dtype == torch.float16:
++                from resident_nv_runtime import forward as project
++            if self.mx_grouped:
++                from .ops.resident_mx import dispatch as project
++            elif self.mx_codes_audited and x.shape[0] in (4, 6, 8) and x.dtype == torch.float16:
++                from .ops.mxfp8_sm75_verify import runtime_forward as project
++            elif self.sm75_mx_prefill and x.shape[0] >= 128 and not torch.cuda.is_current_stream_capturing():
++                from .ops.mxfp8_sm75_prefill import forward as project
++            down = project(self, x, ids, gammas)
+         else:
+             assert self.humming is not None, "process_weights_after_loading"
+             ids, gammas, src2dst = routing
+--- a/vllm/models/inkling2/nvidia/ops/attention.py
++++ b/vllm/models/inkling2/nvidia/ops/attention.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Inkling2 attention kernels: FA4 relative attention, gate/sink, log-scaling."""
+ 
++import os
+ from dataclasses import dataclass
+ from functools import partial
+ from typing import Any
+@@ -11,6 +12,7 @@
+ 
+ from vllm.config import VllmConfig
+ from vllm.distributed import get_tensor_model_parallel_world_size
++from vllm.logger import init_logger
+ from vllm.model_executor.warmup.jit_warmup import VllmJitKernel
+ from vllm.models.inkling.nvidia.ops.fa4_rel_attention import (
+     _num_warps_bucket,
+@@ -21,8 +23,16 @@
+ from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+ 
+ from . import use_pdl, use_sm100_kernels
+-from .attention_sm90 import MODE_GATED, MODE_PARTIAL, rel_attention
++from .attention_sm90 import MODE_GATED, MODE_PARTIAL, rel_attention, segmented_turing_prefill
+ from .pdl import gdc_wait
++
++logger = init_logger(__name__)
++_SM75_GRAPH_KV = os.environ.get("INKLING_GRAPH_KV") == "1"
++_SM75_LOCAL_FA2_Q8 = os.environ.get("INKLING_LOCAL_FA2_Q8") == "1"
++# Only experiment profiles opt into a new target query shape.
++_SM75_VERIFY_ROWS = {"3": (1, 4, 8), "5": (1, 6, 8)}.get(
++    os.environ.get("INKLING_VERIFY_BUDGET"), (1, 8)
++)
+ 
+ # Full-layer FA4 split estimate, fitted on GB200 over uniform and mixed
+ # prefill batches (re-fit for other devices): one CTA per 256-row query tile
+@@ -1121,6 +1131,7 @@
+     softmax_scale: float,
+     is_local: bool,
+     num_splits: int,
++    seq_len_upper_bound: int | None = None,
+ ) -> None:
+     """Write the gated bf16 `(T, H * D)` attention output for small batches.
+ 
+@@ -1151,6 +1162,7 @@
+         softmax_scale,
+         extent if is_local else 0,
+         num_splits,
++        seq_len_upper_bound,
+     )
+ 
+ 
+@@ -1166,6 +1178,7 @@
+     block: int,
+     window: int,
+     num_splits: int,
++    seq_len_upper_bound: int | None = None,
+ ) -> None:
+     """Write the bf16 `(T, H * D)` attention of each `block`-token request
+     to `out`: every query sees the request's keys up to its last one, or the
+@@ -1188,6 +1201,7 @@
+         q.shape[2] ** -0.5,
+         window,
+         num_splits,
++        seq_len_upper_bound,
+     )
+ 
+ 
+@@ -1205,6 +1219,7 @@
+     softmax_scale: float,
+     window: int,
+     num_splits: int,
++    seq_len_upper_bound: int | None = None,
+ ) -> None:
+     """Launch `_rel_verify_kernel` (and the combine for several splits);
+     `rel_gate_sinks` None is the draft mode, `window` 0 a full layer."""
+@@ -1223,6 +1238,62 @@
+     assert key_cache.stride() == value_cache.stride() and key_cache.stride(3) == 1
+     assert q.stride(1) == head_dim and q.stride(2) == 1
+     assert out.is_contiguous()
++    if (_SM75_LOCAL_FA2_Q8 and not draft and window == extent == 1024
++            and num_tokens == max_query_len == num_actual_tokens and num_tokens in (4, 6, 8)
++            and cache_seqlens.numel() == 1 and softmax_scale == 128**-.5
++            and q.dtype == torch.float16 and torch.cuda.get_device_capability(q.device) == (7, 5)):
++        from .local_fa2_q8_sm75 import run_local_fa2
++        if run_local_fa2(q,key_cache,value_cache,rel_logits,gate,sinks,block_table,
++                         cache_seqlens,cu_seqlens_q,out):
++            return
++    if (
++        _SM75_GRAPH_KV and window == 0 and cache_seqlens.numel() == 1
++        and num_actual_tokens == max_query_len == num_tokens and num_tokens in _SM75_VERIFY_ROWS
++        and head_dim == 128 and q.dtype == key_cache.dtype == torch.float16
++        and torch.cuda.get_device_capability(q.device) == (7, 5)
++    ):
++        from .graph_kv_sm75 import graph_attention
++
++        result = graph_attention(
++            q, key_cache, value_cache, None if draft else rel_logits,
++            block_table, cache_seqlens, cu_seqlens_q,
++        )
++        if result is not None:
++            values, logs = result
++            if draft:
++                out.copy_(values.reshape_as(out))
++            else:
++                gate_sink(values, gate, logs.t(), sinks, out)
++            return
++    # A single eager Turing request can share the same paged tensor-core
++    # path as prefill. Verify retains causal masking and relative bias on
++    # the tail. DSpark sees its whole block, including later draft positions.
++    min_length = 16384 if draft else 32768
++    if (window == 0 and (seq_len_upper_bound is None or seq_len_upper_bound >= min_length)
++            and num_actual_tokens == num_tokens
++            and cache_seqlens.numel() == 1 and max_query_len == num_tokens
++            and q.dtype == key_cache.dtype == torch.float16
++            and torch.cuda.get_device_capability(q.device) == (7, 5)
++            and not torch.cuda.is_current_stream_capturing()):
++        # Speculative rejection changes the real length. Host upper bounds
++        # are only estimates during decode; use the device's current value.
++        length = int(cache_seqlens[0].item())
++        if length >= min_length:
++            logger.info_once("SM75 paged decode, query tokens=%d, draft=%s", num_tokens, draft)
++            values = q.new_empty(q.shape, dtype=torch.float32)
++            logs = q.new_empty((num_heads, num_tokens), dtype=torch.float32)
++            segmented_turing_prefill(
++                q, key_cache, value_cache, values, logs, None if draft else rel_logits,
++                seq_len=length, block_table=block_table, cache_seqlens=cache_seqlens,
++                cu_seqlens_q=cu_seqlens_q, max_query_len=max_query_len,
++                softmax_scale=softmax_scale, window=0,
++            )
++            if draft:
++                out.copy_(values.reshape_as(out))
++            else:
++                gate_sink(values, gate, logs.t(), sinks, out)
++            return
++
+     # A single split writes the (gated) output itself.
+     fuse_gate = num_splits == 1
+     o_part = q.new_empty(
+--- a/vllm/models/inkling2/nvidia/ops/attention_sm90.py
++++ b/vllm/models/inkling2/nvidia/ops/attention_sm90.py
+@@ -13,6 +13,10 @@
+ of the rows' visible range, so a split count that depends only on the batch
+ holds for every replay of a CUDA graph.
+ """
++
++from functools import lru_cache
++from math import lcm
++import os
+ 
+ import torch
+ 
+@@ -99,6 +103,7 @@
+     WINDOW: tl.constexpr,
+     DRAFT: tl.constexpr,
+     MODE: tl.constexpr,
++    TURING_PREFILL: tl.constexpr,
+     BLOCK_M: tl.constexpr,
+     BLOCK_N: tl.constexpr,
+ ):
+@@ -156,7 +161,38 @@
+     acc = tl.zeros([BLOCK_M, D], tl.float32)
+     block_table = BlockTable + req.to(tl.int64) * stride_bt
+     kv_off = kv_head * stride_kv_h
+-    for i in range(num_iters):
++    # Adapted from snailbrainx and peaster (Apache-2.0). All distant blocks
++    # remain visible, but have exactly zero learned positional bias.
++    # The near and boundary blocks use the ordinary masked loop.
++    num_far = 0
++    if TURING_PREFILL and WINDOW == 0 and not DRAFT:
++        far_hi = (pos_lo - E + 1) // BLOCK_N
++        num_far = tl.minimum(
++            tl.maximum(far_hi - n_lo - split + num_splits - 1, 0) // num_splits, num_iters
++        )
++    for i in range(num_far):
++        n = n_lo + split + i * num_splits
++        keys = n * BLOCK_N + tl.arange(0, BLOCK_N)
++        page = tl.load(block_table + keys // PAGE)
++        kv_ptrs = (
++            page.to(tl.int64) * stride_kv_blk + (keys % PAGE) * stride_kv_slot + kv_off
++        )
++        if K.dtype.element_ty.primitive_bitwidth == 8:
++            k = _load_fp8_kv(K, kv_ptrs, keys >= 0, q.dtype, D).T
++        else:
++            k = tl.load(K + kv_ptrs[None, :] + offs_d[:, None]).to(q.dtype)
++        s = tl.dot(q, k) * qk_scale
++        m_new = tl.maximum(m_i, tl.max(s, 1))
++        alpha = tl.exp2(m_i - m_new)
++        p = tl.exp2(s - m_new[:, None])
++        l_i = l_i * alpha + tl.sum(p, 1)
++        if V.dtype.element_ty.primitive_bitwidth == 8:
++            v = _load_fp8_kv(V, kv_ptrs, keys >= 0, q.dtype, D)
++        else:
++            v = tl.load(V + kv_ptrs[:, None] + offs_d[None, :]).to(q.dtype)
++        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
++        m_i = m_new
++    for i in range(num_far, num_iters):
+         n = n_lo + split + i * num_splits
+         keys = n * BLOCK_N + tl.arange(0, BLOCK_N)
+         key_valid = keys < seqlen_k
+@@ -260,6 +296,7 @@
+     window: int,
+     num_splits: int,
+     mode: int,
++    prefill_tile: tuple[int, int, int] | None = None,
+ ) -> None:
+     """Launch `_rel_attention_kernel` over the requests of `cu_seqlens_q`.
+ 
+@@ -294,6 +331,13 @@
+     if lse is None:
+         lse = out
+     block_m = _block_m(max_query_len, group)
++    turing = torch.cuda.get_device_capability(q.device) == (7, 5)
++    if turing:
++        block_m = min(block_m, 32)
++    block_n = 32 if turing else (128 if block_m <= 32 else 64)
++    warps = 8 if block_m >= 128 else 4
++    if prefill_tile is not None:
++        block_m, block_n, warps = prefill_tile
+     tokens_per_tile = block_m // group
+     num_reqs = cache_seqlens.shape[0]
+     grid = (
+@@ -342,8 +386,172 @@
+         WINDOW=window,
+         DRAFT=draft,
+         MODE=mode,
++        TURING_PREFILL=turing and not draft and max_query_len > 8,
+         BLOCK_M=block_m,
+-        BLOCK_N=64 if block_m >= 128 else 128 if block_m <= 32 else 64,
+-        num_warps=8 if block_m >= 128 else 4,
+-        num_stages=2,
++        BLOCK_N=block_n,
++        num_warps=warps,
++        num_stages=1 if turing else 2,
+     )
++
++@triton.jit
++def _merge_prefill(Partial, PartialLse, Out, Lse, nt, H: tl.constexpr,
++                   D: tl.constexpr, S: tl.constexpr, stride_lse_h, stride_lse_t):
++    token = tl.program_id(0)
++    head = tl.program_id(1)
++    part = (tl.arange(0, S) * nt + token) * H + head
++    dims = tl.arange(0, D)
++    logs = tl.load(PartialLse + part)
++    peak = tl.max(logs, 0)
++    peak = tl.where(peak == -float("inf"), 0., peak)
++    weights = tl.exp2(logs - peak)
++    total = tl.sum(weights, 0)
++    values = tl.load(Partial + part[:, None] * D + dims[None, :])
++    result = tl.sum(weights[:, None] * values, 0) / tl.where(total > 0., total, 1.)
++    tl.store(Out + (token * H + head) * D + dims, result)
++    tl.store(Lse + head * stride_lse_h + token * stride_lse_t,
++             (peak + tl.log2(total)) * 0.6931471805599453)
++
++
++def turing_prefill(q, k, v, out, lse, rel, *, num_splits, **kwargs):
++    if num_splits == 1:
++        rel_attention(q, k, v, out, lse, rel, num_splits=1, mode=MODE_OUT_LSE, **kwargs)
++        return
++    nt, heads, dim = q.shape
++    assert out.is_contiguous() and num_splits & (num_splits - 1) == 0
++    parts = q.new_empty((num_splits, nt, heads, dim), dtype=torch.float32)
++    logs = q.new_empty((num_splits, nt, heads), dtype=torch.float32)
++    rel_attention(q, k, v, parts, logs, rel, num_splits=num_splits, mode=MODE_PARTIAL, **kwargs)
++    _merge_prefill[(nt, heads)](parts, logs, out, lse, nt, heads, dim, num_splits,
++                                *lse.stride(), num_warps=4)
++
++@lru_cache(maxsize=2)
++def _turing_far_wrapper(device):
++    import flashinfer
++
++    workspace = torch.empty(96 << 20, dtype=torch.uint8, device=device)
++    return flashinfer.BatchPrefillWithPagedKVCacheWrapper(
++        workspace, kv_layout="NHD", backend="fa2"
++    )
++
++
++@triton.jit
++def _merge_near_far(Far, FarLog, Near, NearLog, H: tl.constexpr, D: tl.constexpr,
++                    lh, lt):
++    t, h = tl.program_id(0), tl.program_id(1)
++    row = t * H + h
++    dims = row * D + tl.arange(0, D)
++    a = tl.load(FarLog + row) * 0.6931471805599453  # FlashInfer FA2 returns log2 LSE.
++    b = tl.load(NearLog + h * lh + t * lt)
++    m = tl.maximum(a, b)
++    wa, wb = tl.exp(a - m), tl.exp(b - m)
++    value = wa * tl.load(Far + dims).to(tl.float32) + wb * tl.load(Near + dims)
++    tl.store(Near + dims, value / (wa + wb))
++    tl.store(NearLog + h * lh + t * lt, m + tl.log(wa + wb))
++
++
++USE_TURING_SHEAR = os.environ.get("INKLING_SM75_SHEAR_FA2", "0") == "1"
++USE_TURING_FAR_TILE = os.environ.get("INKLING_SM75_FAR_Q64", "0") == "1"
++
++
++def _try_shear(q, k, v, rel, table, seq_len, out, lse, mode):
++    if not USE_TURING_SHEAR or q.shape[0] < 128:
++        return False
++    from .shear_sm75 import run_shear
++    return run_shear(q, k, v, rel, table, seq_len, out, lse, mode=mode)
++
++
++def segmented_turing_prefill(q, k, v, out, lse, rel, *, seq_len, block_table,
++                             cache_seqlens, cu_seqlens_q, max_query_len,
++                             softmax_scale, window):
++    """Use SM75 tensor cores on complete pages outside every query's bias extent."""
++    nt, heads, dim = q.shape
++    if nt >= 64 and not window and os.environ.get("INKLING_STAGE_HOST_KV") == "1":
++        from inkling_host_kv import is_host_tensor
++        if is_host_tensor(k):
++            from inkling_kv_stage import stage
++            with stage(k, v, block_table, seq_len) as (keys, values, logical_pages):
++                return segmented_turing_prefill(
++                    q, keys, values, out, lse, rel, seq_len=seq_len,
++                    block_table=logical_pages, cache_seqlens=cache_seqlens,
++                    cu_seqlens_q=cu_seqlens_q, max_query_len=max_query_len,
++                    softmax_scale=softmax_scale, window=window)
++    page, kv_heads = k.shape[1:3]
++    extent = 0 if rel is None else rel.shape[-1] - 256
++    # Removing a multiple of the shear period preserves the near logit layout.
++    alignment = lcm(page, 128)
++    far = max(0, seq_len - nt - extent) // alignment * alignment
++    kwargs = dict(block_table=block_table, cache_seqlens=cache_seqlens,
++                  cu_seqlens_q=cu_seqlens_q, max_query_len=max_query_len,
++                  softmax_scale=softmax_scale, window=window)
++    if window or far < 2048:
++        mode = "local" if window else "global"
++        if _try_shear(q, k, v, rel, block_table, seq_len, out, lse, mode):
++            return
++        turing_prefill(q, k, v, out, lse, rel, num_splits=1, **kwargs)
++        return
++
++    pages = far // page
++    wrapper = _turing_far_wrapper(q.device)
++    # CPU length metadata is already exact for prefill. Only the physical
++    # page IDs live on device and can differ between the loop's layer visits.
++    ptr = lambda values: torch.tensor(values, dtype=torch.int32, device="cpu")
++    import tvm_ffi
++
++    tile_module = None
++    if USE_TURING_FAR_TILE:
++        from .far_tile_sm75 import plan_with_selected_module, select_module
++        tile_module = select_module(wrapper, q, k, v, block_table, pages, softmax_scale, seq_len)
++    key = (nt, pages, heads, kv_heads, dim, page, q.dtype, k.dtype, softmax_scale,
++           id(tile_module))
++    # vLLM workers use non-default streams. Both FFI launches and page-table
++    # updates must follow the same stream as the KV writes and Triton merges.
++    with tvm_ffi.use_torch_stream():
++        if getattr(wrapper, "_sm75_plan_key", None) != key:
++            # FlashInfer reuses a pinned host slab during plan(). Its previous
++            # upload must finish before another plan may rewrite that slab.
++            event = getattr(wrapper, "_sm75_plan_upload", None)
++            if event is not None:
++                event.synchronize()
++            indices = block_table[0, :pages].to(torch.int32).clone()
++            if nt > 1024:
++                # No split buffers for unbenchmarked larger prefill chunks.
++                fixed_split = pages
++            elif nt > 512:
++                # Two balanced KV partitions cap FA2 scratch at ~36.3 MiB
++                # for 1024 rows, 12 Q heads/rank, and 3 Q heads per KV head.
++                fixed_split = (pages + 1) // 2
++            elif nt >= 384 and far >= 131072:
++                # Up to eight partitions fit the 96 MiB workspace for M=512.
++                fixed_split = max(1024, (pages + 7) // 8)
++            else:
++                fixed_split = None
++            plan_args = (ptr([0, nt]), ptr([0, pages]), indices, ptr([page]),
++                         heads, kv_heads, dim, page)
++            plan_kwargs = dict(causal=False, q_data_type=q.dtype, kv_data_type=k.dtype,
++                               sm_scale=softmax_scale, fixed_split_size=fixed_split)
++            if USE_TURING_FAR_TILE:
++                plan_with_selected_module(wrapper, tile_module, plan_args, plan_kwargs, pages)
++            else:
++                wrapper.plan(*plan_args, **plan_kwargs)
++            wrapper._sm75_plan_upload = torch.cuda.current_stream(q.device).record_event()
++            wrapper._sm75_plan_key = key
++            wrapper._sm75_page_indices = indices
++        else:
++            wrapper._sm75_page_indices.copy_(block_table[0, :pages])
++        diagnose = not getattr(wrapper, "_sm75_first_pass_complete", False)
++        if diagnose:
++            print("SM75 far prefill", q.shape, q.stride(), k.shape, k.stride(),
++                  block_table.shape, block_table.stride(), block_table.dtype, pages,
++                  block_table[0,:pages].min().item(), block_table[0,:pages].max().item(), flush=True)
++            torch.cuda.synchronize(q.device)
++        far_out, far_lse = wrapper.run(q, (k, v), return_lse=True)
++        if diagnose:
++            torch.cuda.synchronize(q.device)
++    kwargs.update(block_table=block_table[:, pages:], cache_seqlens=cache_seqlens-far)
++    if not _try_shear(q, k, v, rel, kwargs["block_table"], seq_len-far, out, lse, "global"):
++        turing_prefill(q, k, v, out, lse, rel, num_splits=1, **kwargs)
++    _merge_near_far[(nt, heads)](far_out, far_lse, out, lse, heads, dim,
++                                 *lse.stride(), num_warps=4)
++    if diagnose:
++        torch.cuda.synchronize(q.device)
++        wrapper._sm75_first_pass_complete = True
+--- a/vllm/models/inkling2/nvidia/ops/attn_res.py
++++ b/vllm/models/inkling2/nvidia/ops/attn_res.py
+@@ -269,6 +269,17 @@
+     if addend is not None:
+         assert addend.is_contiguous() and addend.shape == last.shape
+     apply_norm = norm_weight is not None
++    if (num_tokens == 2048 and d == 2304 and 1 <= num_stack <= 4
++            and num_q in (1, 3, 4) and normalize_values and eps == 1e-6
++            and last.dtype in (torch.float16, torch.float32)
++            and queries.dtype == torch.float32 and last.is_contiguous()
++            and (norm_weight is None or norm_weight.is_contiguous())
++            and stack.stride(1) == d and stack.stride(2) == 1
++            and (addend is None or addend.is_contiguous())
++            and torch.cuda.get_device_capability(last.device) == (7, 5)
++            and not torch.cuda.is_current_stream_capturing()):
++        from .residual_bank_sm75 import run
++        return run(stack, last, addend, queries, norm_weight, eps=norm_eps, warps=4)
+     if norm_weight is None:
+         norm_weight = queries  # unread
+     assert norm_weight.shape == queries.shape and norm_weight.is_contiguous()
+--- a/vllm/models/inkling2/nvidia/ops/conv_mix.py
++++ b/vllm/models/inkling2/nvidia/ops/conv_mix.py
+@@ -53,7 +53,7 @@
+     assert num_tokens > 0 and conv_out.is_contiguous()
+     assert x.shape[-2:] == (halo + num_tokens, d)
+     assert x.stride(-1) == 1 and x.stride(-2) == d
+-    assert x.dtype == torch.bfloat16
++    assert x.dtype == torch.float16
+     for t in (residual, addend, last):
+         assert t is None or (t.is_contiguous() and t.shape == conv_out.shape)
+     assert residual is None or addend is not None
+--- a/vllm/models/inkling2/nvidia/ops/dspark.py
++++ b/vllm/models/inkling2/nvidia/ops/dspark.py
+@@ -93,7 +93,7 @@
+     row = X + t * row_stride + col0
+     if NORM:
+         w_ptr = tl.where(is_q, Q_WEIGHT.to(tl.int64), K_WEIGHT.to(tl.int64)).to(
+-            tl.pointer_type(tl.bfloat16)
++            tl.pointer_type(tl.float16)
+         )
+         x = tl.load(row + d_ar).to(tl.float32)
+         ms = tl.sum(x * x, 0) / D
+@@ -102,15 +102,15 @@
+         w2 = tl.load(w_ptr + HALF + half_ar).to(tl.float32)
+         x1 = tl.load(row + half_ar).to(tl.float32) * inv * w1
+         x2 = tl.load(row + HALF + half_ar).to(tl.float32) * inv * w2
+-        x1 = x1.to(tl.bfloat16).to(tl.float32)
+-        x2 = x2.to(tl.bfloat16).to(tl.float32)
++        x1 = x1.to(tl.float16).to(tl.float32)
++        x2 = x2.to(tl.float16).to(tl.float32)
+     else:
+         x1 = tl.load(row + half_ar).to(tl.float32)
+         x2 = tl.load(row + HALF + half_ar).to(tl.float32)
+     o1 = x1 * cos - x2 * sin
+     o2 = x2 * cos + x1 * sin
+-    tl.store(row + half_ar, o1.to(tl.bfloat16))
+-    tl.store(row + HALF + half_ar, o2.to(tl.bfloat16))
++    tl.store(row + half_ar, o1.to(tl.float16))
++    tl.store(row + HALF + half_ar, o2.to(tl.float16))
+ 
+ 
+ def qk_norm_rope_(
+@@ -192,11 +192,11 @@
+     mask = cols < N
+     a = tl.load(A + row * stride_a + cols, mask, other=0).to(tl.float32)
+     b = tl.load(B + row * stride_b + cols, mask, other=0).to(tl.float32)
+-    x = (a + b).to(tl.bfloat16)
++    x = (a + b).to(tl.float16)
+     x = x / softcap
+     x = tldevice.tanh(x)
+     x = x * softcap
+-    tl.store(OUT + row * N + cols, x.to(tl.bfloat16), mask)
++    tl.store(OUT + row * N + cols, x.to(tl.float16), mask)
+ 
+ 
+ def add_softcap(a: torch.Tensor, b: torch.Tensor, softcap: float) -> torch.Tensor:
+@@ -235,8 +235,8 @@
+     cand = _round_bf16(tldevice.tanh(cand))
+     keep = _round_bf16(gate * state)
+     update = _round_bf16(_round_bf16(1.0 - gate) * cand)
+-    tl.store(OUT + row * RANK + c, (keep + update).to(tl.bfloat16))
+-    tl.store(LATENT + row * RANK + c, tldevice.tanh(out).to(tl.bfloat16))
++    tl.store(OUT + row * RANK + c, (keep + update).to(tl.float16))
++    tl.store(LATENT + row * RANK + c, tldevice.tanh(out).to(tl.float16))
+ 
+ 
+ def markov_gate(
+--- a/vllm/models/inkling2/nvidia/ops/loop.py
++++ b/vllm/models/inkling2/nvidia/ops/loop.py
+@@ -46,7 +46,7 @@
+     assert dest.shape == message.shape and message.is_contiguous()
+     assert dest.stride(1) == d and dest.stride(2) == 1
+     assert dest.dtype == message.dtype == torch.float32
+-    out = message.new_empty((num_streams, num_tokens, 2 * d), dtype=torch.bfloat16)
++    out = message.new_empty((num_streams, num_tokens, 2 * d), dtype=torch.float16)
+     if num_tokens:
+         _pair_rms_norm_kernel[(num_streams, num_tokens)](
+             dest,
+@@ -111,7 +111,7 @@
+     assert gain_forget.shape == (num_streams, num_tokens, 2 * d)
+     assert gain_forget.is_contiguous() and gain_forget.dtype == torch.float32
+     assert norm_weight.shape == (num_streams, d) and norm_weight.stride(1) == 1
+-    out = message.new_empty((num_streams, num_tokens, d), dtype=torch.bfloat16)
++    out = message.new_empty((num_streams, num_tokens, d), dtype=torch.float16)
+     if num_tokens:
+         _blend_rms_norm_kernel[(num_streams, num_tokens)](
+             dest,
+--- a/vllm/models/inkling2/nvidia/ops/moe_sm90.py
++++ b/vllm/models/inkling2/nvidia/ops/moe_sm90.py
+@@ -9,6 +9,7 @@
+ """
+ 
+ import json
++import os
+ from typing import TYPE_CHECKING
+ 
+ import torch
+@@ -25,6 +26,8 @@
+ 
+ if TYPE_CHECKING:
+     from vllm.utils.humming import HummingInputSchema
++
++_SM75_ROUTER = os.environ.get("INKLING_SM75_ROUTER")
+ 
+ # Row block size when no Humming tuning range covers the row count.
+ _DEFAULT_BLOCK_M = 64
+@@ -84,7 +87,20 @@
+     """
+     tokens = x.shape[0]
+     experts = gate_weight.shape[0]
+-    partials = k_group_partials(x, gate_weight)
++    if _SM75_ROUTER and x.dtype == torch.float16 and gate_weight.shape == (128, 2304):
++        from .router_sm75 import grouped_cublas, whole_cublas
++        from vllm.platforms import current_platform
++        if current_platform.is_device_capability(75):
++            if _SM75_ROUTER == "hybrid" and tokens <= 16:
++                partials = whole_cublas(x, gate_weight)
++            elif _SM75_ROUTER in ("grouped", "hybrid"):
++                partials = grouped_cublas(x, gate_weight)
++            else:
++                partials = k_group_partials(x, gate_weight)
++        else:
++            partials = k_group_partials(x, gate_weight)
++    else:
++        partials = k_group_partials(x, gate_weight)
+     ids = torch.empty((tokens, topk), dtype=torch.int32, device=x.device)
+     weights = torch.empty(tokens * topk, dtype=torch.float32, device=x.device)
+     src2dst = torch.empty(tokens * topk, dtype=torch.int32, device=x.device)
+--- a/vllm/models/inkling2/nvidia/ops/sconv.py
++++ b/vllm/models/inkling2/nvidia/ops/sconv.py
+@@ -264,7 +264,8 @@
+         + (safe_slot % N)[:, None] * stride_c_n
+         + cache_col[None, :]
+     )
+-    tl.store(dst, cur, mask=tc_mask & valid[:, None])
++    # Block 0 is the null block: with the tail-only conv-state manager, tokens below a step's tail have no state.
++    tl.store(dst, cur, mask=tc_mask & (slot >= N)[:, None])
+ 
+     tap_args = (
+         x_ptr,
+--- a/vllm/models/inkling2/nvidia/sconv.py
++++ b/vllm/models/inkling2/nvidia/sconv.py
+@@ -268,7 +268,7 @@
+         )
+         cache = torch.empty(
+             (1, owner.num_kv_heads, owner.block_size, owner.head_size),
+-            dtype=torch.bfloat16,
++            dtype=torch.float16,
+             device=positions.device,
+         )
+         return metadata, cache, owner.block_size
+--- a/vllm/models/inkling2/quant_config.py
++++ b/vllm/models/inkling2/quant_config.py
+@@ -39,11 +39,11 @@
+ 
+     @classmethod
+     def get_supported_act_dtypes(cls) -> list[torch.dtype]:
+-        return [torch.bfloat16]
++        return [torch.float16, torch.bfloat16]
+ 
+     @classmethod
+     def get_min_capability(cls) -> int:
+-        return 80
++        return 75
+ 
+     @staticmethod
+     def get_config_filenames() -> list[str]:
+--- a/vllm/models/inkling2/speculator_config.py
++++ b/vllm/models/inkling2/speculator_config.py
+@@ -10,7 +10,8 @@
+ 
+ 
+ class Inkling2DSparkSpeculatorConfig(DSparkSpeculatorConfig):
+-    speculator_class = "vllm.models.inkling2.speculator.Inkling2DSparkSpeculator"
++    speculator_class = "hybrid_head.BudgetDSpark"
++    prefer_dense_token_history = True
+ 
+     @classmethod
+     def adapt_draft_model_config(cls, spec: "SpeculativeConfig") -> None:
+--- a/vllm/v1/attention/backends/fa_utils.py
++++ b/vllm/v1/attention/backends/fa_utils.py
+@@ -15,13 +15,32 @@
+ # consistent behavior (similar to IS_AITER_FOUND in _aiter_ops.py).
+ _ROCM_FLASH_ATTN_AVAILABLE = False
+ 
++_CUDA_FLASH_ATTN_AVAILABLE = False
++
+ if current_platform.is_cuda():
+     from vllm._custom_ops import reshape_and_cache_flash
+-    from vllm.vllm_flash_attn import (  # type: ignore[attr-defined]
+-        compile_flash_attn_varlen_func_from_specs,
+-        flash_attn_varlen_func,
+-        get_scheduler_metadata,
+-    )
++    try:
++        from vllm.vllm_flash_attn import (  # type: ignore[attr-defined]
++            FA2_AVAILABLE,
++            FA3_AVAILABLE,
++            compile_flash_attn_varlen_func_from_specs,
++            flash_attn_varlen_func,
++            get_scheduler_metadata,
++        )
++
++        _CUDA_FLASH_ATTN_AVAILABLE = FA2_AVAILABLE or FA3_AVAILABLE
++    except ImportError:
++        # SM75 has no supported FA2/FA3/FA4 extension. Keep the symbols
++        # available for callers, while making backend selection fall back.
++        compile_flash_attn_varlen_func_from_specs = None  # type: ignore[assignment]
++
++        def flash_attn_varlen_func(*args: Any, **kwargs: Any) -> Any:  # type: ignore[no-redef,misc]
++            raise ImportError(
++                "CUDA FlashAttention extensions are unavailable for this device"
++            )
++
++        def get_scheduler_metadata(*args: Any, **kwargs: Any) -> None:  # type: ignore[misc]
++            return None
+ 
+ elif current_platform.is_xpu():
+     from vllm import _custom_ops as ops
+--- a/vllm/v1/core/kv_cache_coordinator.py
++++ b/vllm/v1/core/kv_cache_coordinator.py
+@@ -330,7 +330,11 @@
+             request.num_prompt_tokens,
+             num_hash_lookahead_tokens=self.block_pool.num_hash_lookahead_tokens,
+         )
++        from inkling_cache_recent import boundaries as nearby_boundaries
++        boundaries = nearby_boundaries(boundaries, request.num_prompt_tokens, 2048, 4)
+         num_cacheable_tokens = self.get_num_cacheable_tokens(num_computed_tokens)
++        # A follow-up may include generated IDs whose K/V came from small verification batches.
++        num_cacheable_tokens = min(num_cacheable_tokens, request.num_prompt_tokens)
+         for manager in self.single_type_managers:
+             if not manager.enable_caching:
+                 continue
+--- a/vllm/v1/core/kv_cache_manager.py
++++ b/vllm/v1/core/kv_cache_manager.py
+@@ -312,11 +312,10 @@
+         # num_computed_tokens to be block-size aligned. Removing this limitation
+         # could slightly improve performance in the future.
+         max_cache_hit_length = request.get_max_cache_hit_length(max_cache_hit_length)
+-        computed_blocks, num_new_computed_tokens, num_uncached = (
+-            self.coordinator.find_longest_cache_hit(
+-                request.block_hashes, max_cache_hit_length, request.num_tokens
+-            )
+-        )
++        from inkling_chunk_cache import find_hit
++        computed_blocks, num_new_computed_tokens, num_uncached = find_hit(
++            self.coordinator.find_longest_cache_hit, request.block_hashes,
++            max_cache_hit_length, request.num_tokens, chunk=2048)
+ 
+         # When kv_cache_report_mode is "full", emit BlockStored events
+         # for the reused prefix cache blocks so that external consumers
+@@ -648,6 +647,8 @@
+ 
+         """
+         self.coordinator.free(request)
++        from inkling_cache_recent import refresh
++        refresh(self.coordinator, request, 2048, 4)
+ 
+     def remove_skipped_blocks(
+         self,
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -83,6 +83,7 @@
+     SchedulerStats,
+ )
+ from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
++from tail_decode import select_rows as _tail_select
+ from vllm.v1.request import Request, RequestStatus, StreamingUpdate
+ from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
+ from vllm.v1.spec_decode.metrics import SpecDecodingStats
+@@ -840,6 +841,15 @@
+                 - request.num_computed_tokens
+                 - self.num_sampled_tokens_per_step,
+             )
++            _tail_capacity = self.max_model_len - request.num_computed_tokens - self.num_sampled_tokens_per_step
++            _tail_real = request.num_tokens + request.num_output_placeholders - request.num_computed_tokens
++            _tail_requested = _tail_real + len(request.spec_token_ids)
++            _tail_before = num_new_tokens
++            if self.max_num_running_reqs == 1 and self.num_spec_tokens == 7 and self.num_sampled_tokens_per_step == 1:
++                _tail_k = self.dynamic_sd_lookup[1] if self.dynamic_sd_lookup is not None else self.num_spec_tokens
++                num_new_tokens = _tail_select(num_new_tokens, _tail_requested, _tail_capacity,
++                                              _tail_real, request.num_output_tokens, request.spec_token_ids, _tail_k + 1)
++
+ 
+             # Apply Mamba alignment before encoder caps.
+             if self.need_mamba_block_aligned_split:
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -769,7 +769,16 @@
+ 
+         model_executed = False
+         # Workers need a deferred step's sample_tokens() before the next step.
+-        if self.deferred_step is None and self.scheduler.has_requests():
++        overlap_limit = self.vllm_config.small_batch_overlap_limit
++        large_batch_in_flight = overlap_limit is not None and any(
++            scheduled.total_num_scheduled_tokens > overlap_limit
++            for _, scheduled, _ in batch_queue
++        )
++        if (
++            self.deferred_step is None
++            and not large_batch_in_flight
++            and self.scheduler.has_requests()
++        ):
+             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+             with self.log_error_detail(scheduler_output):
+                 exec_future = self.model_executor.execute_model(
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -195,6 +195,7 @@
+ )
+ from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
+ from vllm.v1.worker.replayssm_utils import get_replayssm_block_copy_tensors
++from tail_decode import capture_widths as _tail_capture_widths
+ from vllm.v1.worker.utils import (
+     KVBlockZeroer,
+     clear_layer_kv_caches,
+@@ -827,8 +828,8 @@
+             self.vllm_config,
+             self.device,
+             cudagraph_mode,
+-            decode_query_lens=self.vllm_config.get_decode_cudagraph_query_lens(
+-                self.decode_query_len
++            decode_query_lens=_tail_capture_widths(
++                self.vllm_config.get_decode_cudagraph_query_lens(self.decode_query_len), self.max_num_reqs
+             ),
+             lora_capture_cases=self.lora_capture_cases,
+             varlen_decode=self.adaptive_verification is not None,
+--- a/vllm/v1/worker/gpu/sample/prompt_logprob.py
++++ b/vllm/v1/worker/gpu/sample/prompt_logprob.py
+@@ -17,7 +17,7 @@
+     compute_topk_scores,
+ )
+ 
+-CHUNK_SIZE = 1024
++CHUNK_SIZE = 32
+ # Cap rows x k per torch.topk call, whose workspace grows with both (~5.5 GiB
+ # for 1024 rows at a 152k vocab). Only splits chunks when k is very large.
+ TOPK_MAX_ELEMENTS = 64 << 20
+--- a/vllm/v1/worker/gpu/sample/sampler.py
++++ b/vllm/v1/worker/gpu/sample/sampler.py
+@@ -34,7 +34,7 @@
+ from vllm.v1.worker.gpu.sample.output import SamplerOutput, SamplingMaskTensors
+ from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
+ from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS, SamplingStates
+-from vllm.v1.worker.gpu.sample.thinking_budget import ThinkingBudgetState
++from inkling_thinking_budget import InklingThinkingBudgetState as ThinkingBudgetState
+ from vllm.v1.worker.gpu.sample.trace_replay import TraceReplayState
+ from vllm.v1.worker.gpu.states import RequestState
+ 
+--- a/vllm/v1/worker/utils.py
++++ b/vllm/v1/worker/utils.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import math
++import os
+ from collections import defaultdict
+ from collections.abc import Callable, Iterable, Mapping, Sequence
+ from dataclasses import dataclass, field, replace
+@@ -612,6 +613,12 @@
+     if not kv_cache_config.kv_cache_tensors:
+         return {}
+ 
++    if (gpu_lanes := os.environ.get("INKLING_HOST_KV_GPU_LANES")) and kv_cache_config.num_blocks > 64:
++        if allocate is not None:
++            raise ValueError("Mapped Inkling KV requires a fixed KV pool")
++        from inkling_host_kv import allocate as allocate_mapped
++        return allocate_mapped(kv_cache_config, device, layout, kernel_block_sizes, int(gpu_lanes))
++
+     sizes = {tensor.size for tensor in kv_cache_config.kv_cache_tensors}
+     assert len(sizes) == 1, "KV cache tensors must share one backing allocation."
+     raw_size = sizes.pop()

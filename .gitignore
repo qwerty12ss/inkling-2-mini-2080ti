@@ -1,0 +1,15 @@
+.work/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.env
+*.private.*
+*.safetensors
+*.pt
+*.so
+*.cubin
+*.o
+*.log
+results-local/

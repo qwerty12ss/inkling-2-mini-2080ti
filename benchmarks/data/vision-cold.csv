@@ -1,0 +1,6 @@
+case,route,width,height,input_tokens,output_tokens,image_tokens,cached_tokens,engine_ttft_s,engine_prefill_s,engine_decode_s,proposed_draft_tokens,accepted_draft_tokens,free_tp0_mib,free_tp1_mib
+short-coffee,engine,600,400,209,42,151,0,0.25669241,0.239867876,0.229752382,65,29,680.312,682.312
+short-astronaut,engine,512,512,228,43,170,0,0.386412621,0.3598235,0.409180192,85,27,684.312,682.312
+long-458496,engine,1024,768,458496,256,521,0,197.223147869,195.785151177,3.152448361,445,163,680.312,682.312
+image-and-notes,gateway,1024,768,6576,91,521,0,1.635164,1.57547,,,64,,
+image-and-code,gateway,1024,768,458498,137,521,0,192.961941,191.30432,,270,84,,

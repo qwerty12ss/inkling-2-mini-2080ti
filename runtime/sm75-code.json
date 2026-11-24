@@ -1,0 +1,46 @@
+{
+  "flashinfer/inkling_far_q64_schedules_sm75_pipe_v1": {
+    "sections": 120,
+    "sha256": "471df28b9b05f61872cba6230f20b2e3be7a5346448302b6d7d075ee4c3acb4d"
+  },
+  "flashinfer/inkling_far_q64_schedules_sm75_qreg2_v1": {
+    "sections": 120,
+    "sha256": "c9b66b63a609c3c826a68338b33103bdcd37efae2f2c9b67833ff1fa6d6c2d14"
+  },
+  "flashinfer/inkling_global_far_sm75_f32": {
+    "sections": 120,
+    "sha256": "9828f415f97fd512083f2c89bc051334f8709b62a3f56f7886e8f205bcd1a848"
+  },
+  "flashinfer/inkling_global_q_sm75_f32_v1": {
+    "sections": 120,
+    "sha256": "aed78350e25261f0acccb2150e65febbada1b82170a31439fc558367e0d13e4f"
+  },
+  "flashinfer/inkling_local_q8_sm75_fp32_v2": {
+    "sections": 120,
+    "sha256": "858002524f7d97a3b68d8b3e2a2ceae699d4d8171e951c96694b9647ba1d7068"
+  },
+  "flashinfer/inkling_shear_fa2_sm75_v1": {
+    "sections": 120,
+    "sha256": "b694e882f321f110ae9876e9ec34b7f6e8f5ec244bb6518092ac3d00c158edf8"
+  },
+  "libdense12_integrated.so": {
+    "sections": 9,
+    "sha256": "6efc2aa59540320dd4d1a587c3cfc7506c6f73fa3c906d6649a22bb1fb4399fe"
+  },
+  "libinkling_head_int8.so": {
+    "sections": 2,
+    "sha256": "d171508f13dc45bfb4905a69823ca72ea2474fdd5aee54e33b25a5d83644e1c2"
+  },
+  "libinkling_stable_routes.so": {
+    "sections": 19,
+    "sha256": "1ebb65ba1e0025051d5e19c383f155cc67dd3f1fb822c0f819b016694068a1a8"
+  },
+  "resident_bank/skinny.so": {
+    "sections": 6,
+    "sha256": "6c672637c0e9dfacc6ada1f57ba8a1f649feb28f3030b1a396b498baeef93af4"
+  },
+  "vllm/models/inkling2/nvidia/ops/inkling_marlin_mx32f32.so": {
+    "sections": 16,
+    "sha256": "b62674708a9659322f1597f260a8b9d24c5d23bc0eaa3092bea8ef7ecc3effa7"
+  }
+}

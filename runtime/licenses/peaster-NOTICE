@@ -1,0 +1,46 @@
+Inkling 2 Mini on vLLM for Ampere GPUs
+Copyright 2026 peaster
+
+This repository contains no vLLM, Triton or model binaries. The Dockerfile
+downloads the official vllm/vllm-openai image and one official vLLM wheel at
+build time.
+
+Portions derived from other projects:
+
+- apply_sm86_patch.py and tools/widen_test_gates.py quote short passages of
+  vLLM (Apache-2.0, https://github.com/vllm-project/vllm) and Triton (MIT,
+  https://github.com/triton-lang/triton) as patch anchors and as the text
+  that replaces them.
+- patches/sm86-tune.diff modifies files of vLLM (Apache-2.0, copyright the
+  vLLM contributors). Part of it is adapted from
+  snailbrainx/inkling-2-mini-sm80 (Apache-2.0, Copyright 2026 snailbrainx,
+  https://github.com/snailbrainx/inkling-2-mini-sm80): the Ampere tiles of
+  the low-row GEMV kernel, the one-launch q/k/v projection, the loop
+  controller kernels, the drafter's Markov fold on the GEMV, the draft
+  length range, the far-block loop of the attention kernel and the
+  one-kernel moe_align_block_size. Changed here: a shared-memory fit so
+  the tiles run on sm_86, switches for each tuning, and the expert-GEMM
+  alignment limited to the batch sizes where its output is identical to
+  the compiled op's. Added here: expert-GEMM kernel configs, router
+  and attention tiles measured on sm_86, the draft length chosen per step
+  from recent acceptance, and the reduced draft vocabulary.
+  Another part is adapted from Pento95/HyperInkling (Apache-2.0,
+  https://github.com/Pento95/HyperInkling): the conv-state cache manager
+  that backs only each step's tail (SconvStateManager) and the conv
+  kernel's skipped stores into the null block. Added to it here: conv-state
+  checkpoints at the prefix-cache retention interval, and the switch.
+- tools/tests/conftest.py reproduces three fixtures from vLLM's
+  tests/conftest.py.
+- tools/gsm8k_eval.py follows the chat protocol of vLLM's
+  tests/evals/gsm8k/gsm8k_eval.py.
+- tools/tune/published_protocols.py re-implements the benchmark protocols
+  of agent2x0r/inkling2-sm86-kernels (MIT) and Pento95/HyperInkling and
+  sends their prompts; no code from either is included.
+- patches/draft_vocab_rank.json is a list of token ids in rank order and
+  contains no text. The counts behind it came from this model's own output
+  and from wikitext-2 (CC BY-SA 3.0), HellaSwag (MIT), War and Peace (public
+  domain, Project Gutenberg), vLLM's Python source (Apache-2.0), ggml's C
+  source (MIT) and a private tree of configs and docs.
+- tools/tune/more_protocols.py re-implements the benchmark protocols of
+  lulakien/inkling2-mini-3090-recipe and skyne98/inkling-ingine-3090 from
+  the prompts and parameters they publish; it contains none of their code.
